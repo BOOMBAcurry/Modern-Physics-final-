@@ -1,0 +1,242 @@
+/*
+ * LED I-V Curve Measurement System (DAC and Sweep Only)
+ * 
+ * Hardware Setup:
+ * - MCP4725 DAC: Controls LED voltage (I2C address 0x60 or 0x61)
+ * - LED Circuit: DAC -> Resistor (1200Ω) -> A0 pin -> LED Anode -> LED Cathode -> GND
+ * 
+ * The A0 pin measures voltage at the LED anode to calculate current through the LED
+ * 
+ * I2C Connections:
+ * - SDA: Arduino A4 (Uno/Nano) or pin 20 (Mega)
+ * - SCL: Arduino A5 (Uno/Nano) or pin 21 (Mega)
+ */
+
+#include <Wire.h>
+#include <Adafruit_MCP4725.h>
+
+// Create object for DAC
+Adafruit_MCP4725 dac;
+
+// ===== PIN DEFINITIONS =====
+const int measure_led_v = A0;      // Analog pin to measure LED voltage
+
+// ===== CIRCUIT CONSTANTS =====
+const float Vcc_nominal = 5.0;     // Arduino supply voltage (change to 3.3 if using 3.3V)
+const float ADC_COUNTS = 1023.0;   // 10-bit ADC (0-1023)
+const int DAC_COUNTS = 4095;       // 12-bit DAC (0-4095)
+const float R_series = 1200.0;     // Series resistor in ohms (CHANGE THIS TO YOUR RESISTOR VALUE)
+
+// ===== SWEEP PARAMETERS =====
+const int sweep_step = 8;          // DAC increment per step (larger = faster but less detailed)
+const int settle_ms = 5;           // Wait time after changing DAC for voltage to stabilize
+
+// ===== GLOBAL VARIABLES =====
+bool correct_Vcc = false;          // Enable/disable Vcc correction
+String serial_command;              // Stores incoming serial commands
+
+// ===== HELPER FUNCTIONS =====
+
+/**
+ * Read analog voltage from a pin
+ * @param pin - Analog pin number (e.g., A0)
+ * @param vcc - Reference voltage for ADC
+ * @return Voltage in volts
+ */
+float readAnalogVoltage(int pin, float vcc) {
+  int raw = analogRead(pin);
+  return (raw / ADC_COUNTS) * vcc;
+}
+
+/**
+ * Read actual Vcc voltage using internal bandgap reference
+ * This compensates for USB voltage variations
+ * @return Vcc in millivolts
+ */
+long readVcc() {
+  long result;
+  // Set ADC to read internal 1.1V reference against Vcc
+#if defined(__AVR_ATmega32U4__) || defined(__AVR_ATmega1280__) || defined(__AVR_ATmega2560__)
+  ADMUX = _BV(REFS0) | _BV(MUX4) | _BV(MUX3) | _BV(MUX2) | _BV(MUX1);
+#elif defined (__AVR_ATtiny24__) || defined(__AVR_ATtiny44__) || defined(__AVR_ATtiny84__)
+  ADMUX = _BV(MUX5) | _BV(MUX0);
+#elif defined (__AVR_ATtiny25__) || defined(__AVR_ATtiny45__) || defined(__AVR_ATtiny85__)
+  ADMUX = _BV(MUX3) | _BV(MUX2);
+#else
+  ADMUX = _BV(REFS0) | _BV(MUX3) | _BV(MUX2) | _BV(MUX1);
+#endif
+  delay(2);                         // Wait for Vref to settle
+  ADCSRA |= _BV(ADSC);             // Start conversion
+  while (bit_is_set(ADCSRA, ADSC)); // Wait for completion
+  result = ADCL;
+  result |= ADCH << 8;
+  result = 1126400L / result;       // Back-calculate Vcc in mV (1126400 = 1.1 * 1023 * 1000)
+  return result;
+}
+
+/**
+ * Get actual Vcc voltage (with or without correction)
+ * @return Vcc in volts
+ */
+float getVccActual() {
+  if (!correct_Vcc) return Vcc_nominal;
+  return (readVcc() / 1000.0);      // Convert mV to V
+}
+
+/**
+ * Perform voltage sweep to measure LED I-V curve
+ * Sweeps DAC from 0V to maximum, measuring current at each step
+ * Outputs CSV format: Vdac(V), V_led(V), I_led(A)
+ */
+void doSweep() {
+  digitalWrite(13, HIGH);            // Turn on onboard LED during sweep
+  
+  // Send CSV header (added V_led for debugging)
+  Serial.println("HEADER,Vdac(V),V_led(V),I_led(A)");
+  
+  // Sweep from 0 to maximum DAC value
+  for (int d = 0; d <= DAC_COUNTS; d += sweep_step) {
+    // Set DAC output voltage
+    dac.setVoltage(d, false);
+    delay(settle_ms);                // Wait for voltage to stabilize
+    
+    // Get current Vcc (supply voltage)
+    float vcc_now = getVccActual();
+    
+    // Calculate DAC output voltage: V_dac = (DAC_value / 4095) * Vcc
+    float v_dac = (d / (float)DAC_COUNTS) * vcc_now;
+    
+    // Measure voltage at LED anode (after resistor)
+    float v_led = readAnalogVoltage(measure_led_v, vcc_now);
+    
+    // Calculate voltage drop across resistor
+    float v_res = v_dac - v_led;
+    if (v_res < 0.0) v_res = 0.0;    // Clamp to zero if negative (measurement noise)
+    
+    // Calculate LED current using Ohm's law: I = V / R
+    float i_led = v_res / R_series;
+    
+    // Output data point (including V_led for debugging)
+    Serial.print(v_dac, 4);          // 4 decimal places
+    Serial.print(',');
+    Serial.print(v_led, 4);          // 4 decimal places
+    Serial.print(',');
+    Serial.println(i_led, 9);        // 9 decimal places for precision
+  }
+  
+  Serial.println("END");             // Signal end of sweep
+  dac.setVoltage(0, false);          // Turn off LED
+  digitalWrite(13, LOW);             // Turn off onboard LED
+}
+
+/**
+ * Set DAC to specific voltage for testing
+ * @param voltage - Target voltage in volts
+ */
+void setDacVoltage(float voltage) {
+  float vcc_now = getVccActual();
+  int dac_value = (int)((voltage / vcc_now) * DAC_COUNTS);
+  dac_value = constrain(dac_value, 0, DAC_COUNTS);
+  dac.setVoltage(dac_value, false);
+  
+  // Report what was set
+  Serial.print("DAC_SET,");
+  Serial.print(voltage, 4);
+  Serial.print(",");
+  Serial.println(dac_value);
+}
+
+/**
+ * Test DAC by stepping through several voltages
+ */
+void testDac() {
+  Serial.println("DAC_TEST_START");
+  float test_voltages[] = {0.0, 1.0, 2.0, 3.0, 4.0, 5.0};
+  
+  for (int i = 0; i < 6; i++) {
+    float target = test_voltages[i];
+    setDacVoltage(target);
+    delay(100);
+    
+    // Measure actual voltages
+    float vcc_now = getVccActual();
+    float v_led = readAnalogVoltage(measure_led_v, vcc_now);
+    
+    Serial.print("TEST,");
+    Serial.print(target, 2);
+    Serial.print(",");
+    Serial.println(v_led, 4);
+  }
+  
+  dac.setVoltage(0, false);  // Turn off
+  Serial.println("DAC_TEST_END");
+}
+
+// ===== ARDUINO SETUP =====
+void setup() {
+  Serial.begin(9600);
+  Wire.begin();                      // Initialize I2C bus
+
+  // Initialize MCP4725 DAC
+  if (!dac.begin(0x60)) {
+    // Try alternate address if 0x60 fails
+    if (!dac.begin(0x61)) {
+      Serial.println("ERR_NO_DAC");
+      while (1) { delay(100); }      // Halt if DAC not found
+    }
+  }
+
+  // Ensure DAC starts at 0V (LED off)
+  dac.setVoltage(0, false);
+  
+  // Configure onboard LED for status indication
+  pinMode(13, OUTPUT);
+  
+  Serial.println("READY");           // Signal that system is ready
+  Serial.println("Commands: run, test_dac, set_dac,X.XX, CVcc,t, CVcc,f");
+}
+
+// ===== ARDUINO MAIN LOOP =====
+void loop() {
+  // Check if serial data is available
+  if (!Serial.available()) {
+    return;
+  }
+  
+  // Read command (terminated by '/')
+  serial_command = Serial.readStringUntil('/');
+  serial_command.trim();
+  if (serial_command.length() == 0) return;
+
+  // ===== COMMAND HANDLERS =====
+  
+  // Enable Vcc correction
+  if (serial_command == "CVcc,t") {
+    correct_Vcc = true;
+    Serial.println("CVcc,ON");
+  } 
+  // Disable Vcc correction
+  else if (serial_command == "CVcc,f") {
+    correct_Vcc = false;
+    Serial.println("CVcc,OFF");
+  } 
+  // Run voltage sweep
+  else if (serial_command == "run") {
+    doSweep();
+  }
+  // Test DAC with preset voltages
+  else if (serial_command == "test_dac") {
+    testDac();
+  }
+  // Set DAC to specific voltage
+  else if (serial_command.startsWith("set_dac,")) {
+    String voltage_str = serial_command.substring(8);
+    float voltage = voltage_str.toFloat();
+    setDacVoltage(voltage);
+  }
+  // Unknown command
+  else {
+    Serial.print("UNK_CMD:");
+    Serial.println(serial_command);
+  }
+}
